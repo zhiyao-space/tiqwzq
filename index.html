@@ -240,6 +240,35 @@ select {
 }
 #output::placeholder { color: rgba(30, 35, 56, 0.4); }
 
+/* ---- 智能分类 ---- */
+#clsWrap { margin-top: 18px; }
+.cls-block {
+  background: rgba(255, 255, 255, 0.4);
+  border: 1px solid rgba(255, 255, 255, 0.8);
+  border-radius: 14px;
+  padding: 12px 14px;
+  margin-bottom: 10px;
+}
+.cls-head { display: flex; align-items: center; gap: 8px; margin-bottom: 8px; font-weight: 600; }
+.cls-head .cnt { font-weight: 400; font-size: 13px; color: var(--muted); }
+.cls-box {
+  width: 100%;
+  min-height: 58px;
+  max-height: 180px;
+  border: 1px solid rgba(255, 255, 255, 0.85);
+  border-radius: 10px;
+  padding: 8px 10px;
+  font-size: 13.5px;
+  font-family: inherit;
+  line-height: 1.6;
+  background: rgba(255, 255, 255, 0.55);
+  color: var(--ink);
+  resize: vertical;
+}
+.cls-box:focus { outline: none; border-color: var(--accent); }
+.cls-empty { font-size: 13px; color: var(--muted); }
+button.mini { padding: 4px 12px; font-size: 13px; border-radius: 9px; }
+
 /* ---- 页脚 ---- */
 .foot { font-size: 13px; color: var(--muted); }
 .foot strong { color: var(--ink); }
@@ -334,6 +363,16 @@ select {
     </button>
   </div>
   <textarea id="output" spellcheck="false" placeholder="识别出的文字会显示在这里,可直接选取需要的部分、编辑,然后复制。"></textarea>
+
+  <div id="clsWrap" hidden>
+    <div class="row" style="margin-bottom: 10px;">
+      <strong>智能分类</strong>
+      <span class="dim">自动识别链接 / 编号 / 其他文本</span>
+      <span class="spacer"></span>
+      <button id="btnReclassify" class="ghost mini" type="button">按当前内容重新分类</button>
+    </div>
+    <div id="clsList"></div>
+  </div>
 </section>
 
 <footer class="card foot">
@@ -350,7 +389,8 @@ select {
       progressWrap = $('progressWrap'), progressBar = $('progressBar'),
       statusEl = $('status'),
       stepResult = $('stepResult'), output = $('output'), countEl = $('count'),
-      appendMode = $('appendMode');
+      appendMode = $('appendMode'),
+      clsWrap = $('clsWrap'), clsList = $('clsList');
 
   var currentBlob = null, currentURL = null;
   var sel = null;                 // 框选区域(原图坐标)
@@ -497,6 +537,31 @@ select {
     return c;
   }
 
+  /* 超大图自动降采样,大幅加快识别(1800px 以内不影响常规文字精度) */
+  function prepareInput() {
+    var maxSide = 1800;
+    var sx = 0, sy = 0;
+    var w = preview.naturalWidth, h = preview.naturalHeight;
+    if (sel) {
+      sx = Math.round(sel.x0);
+      sy = Math.round(sel.y0);
+      w = Math.round(sel.x1 - sel.x0);
+      h = Math.round(sel.y1 - sel.y0);
+    }
+    var scale = Math.min(1, maxSide / Math.max(w, h));
+    if (scale >= 1) return sel ? cropCanvas() : currentBlob;
+    var sw = Math.max(1, Math.min(Math.round(w * scale), preview.naturalWidth - sx));
+    var sh = Math.max(1, Math.min(Math.round(h * scale), preview.naturalHeight - sy));
+    var c = document.createElement('canvas');
+    c.width = sw;
+    c.height = sh;
+    var ctx = c.getContext('2d');
+    ctx.imageSmoothingEnabled = true;
+    ctx.imageSmoothingQuality = 'high';
+    ctx.drawImage(preview, sx, sy, w, h, 0, 0, sw, sh);
+    return c;
+  }
+
   /* ---------- 识别 ---------- */
   var STATUS_ZH = {
     'loading tesseract core': '加载识别核心…',
@@ -557,7 +622,7 @@ select {
     getWorker(langSel.value)
       .then(function (w) {
         setStatus(sel ? '正在识别框选区域…' : '正在识别整张图…');
-        return w.recognize(sel ? cropCanvas() : currentBlob);
+        return w.recognize(prepareInput());
       })
       .then(function (res) {
         var text = cleanText(res.data.text || '');
@@ -568,6 +633,7 @@ select {
           else output.value = text;
           stepResult.hidden = false;
           updateCount();
+          renderClassification();
           output.focus();
           progressBar.style.width = '100%';
           setStatus('识别完成,用时 ' + Math.round((Date.now() - t0) / 1000) +
@@ -583,30 +649,143 @@ select {
       .then(function () { btnRun.disabled = false; });
   });
 
+  /* ---------- 智能分类 ---------- */
+  var URL_RE = /(?:https?[:：]|[wW]{3}[.:：。])[^\s\u4e00-\u9fff，。；、！？…（）()【】“”‘’"']+/gi;
+  var MAIL_RE = /[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}/g;
+  var DOM_RE = /\b(?:[A-Za-z0-9-]+\.)+(?:com|cn|net|org|io|edu|gov|top|xyz|vip|shop|app|dev|co|me|tv|cc|info|biz|site|online|tech|cloud|link|page|hk|tw|jp|kr|us|uk|de|fr)\b(?:[\/?#][^\s\u4e00-\u9fff，。；、！？…（）()【】“”‘’"']*)?/gi;
+  var NUM_RE = /\d{5,}(?:[-—–/.]\d+)*/g;
+  var CODE_RE = /\b[A-Za-z][A-Za-z-]*\d{4,}[A-Za-z\d-]*\b/g;
+
+  function uniqPush(arr, seen, v) {
+    v = v.trim();
+    if (!v || seen.indexOf(v) !== -1) return;
+    seen.push(v);
+    arr.push(v);
+  }
+
+  function classifyText(text) {
+    var links = [], codes = [], others = [];
+    var seenL = [], seenC = [], seenO = [];
+    text.split('\n').forEach(function (rawLine) {
+      var line = rawLine.trim();
+      if (!line) return;
+      var rest = line, m;
+      MAIL_RE.lastIndex = 0;
+      while ((m = MAIL_RE.exec(line)) !== null) uniqPush(links, seenL, m[0]);
+      rest = rest.replace(MAIL_RE, ' ');
+      URL_RE.lastIndex = 0;
+      while ((m = URL_RE.exec(line)) !== null) {
+        uniqPush(links, seenL, m[0].replace(/[.,;:!?…））】”’]+$/, ''));
+      }
+      rest = rest.replace(URL_RE, ' ');
+      DOM_RE.lastIndex = 0;
+      while ((m = DOM_RE.exec(rest)) !== null) {
+        var d = m[0].replace(/[.,;:!?…）]+$/, '');
+        if (/[A-Za-z]/.test(d)) uniqPush(links, seenL, d);
+      }
+      rest = rest.replace(DOM_RE, ' ');
+      CODE_RE.lastIndex = 0;
+      while ((m = CODE_RE.exec(rest)) !== null) uniqPush(codes, seenC, m[0]);
+      rest = rest.replace(CODE_RE, ' ');
+      NUM_RE.lastIndex = 0;
+      while ((m = NUM_RE.exec(rest)) !== null) uniqPush(codes, seenC, m[0]);
+      rest = rest.replace(NUM_RE, ' ').replace(CODE_RE, ' ')
+        .replace(/[ \t]{2,}/g, ' ')
+        .replace(/^[-—–:：、,，.。;；\s]+|[-—–:：、,，.。;；\s]+$/g, '');
+      if (rest.replace(/[^\u4e00-\u9fffa-zA-Z0-9]/g, '').length >= 4) {
+        uniqPush(others, seenO, rest);
+      }
+    });
+    return { links: links, codes: codes, others: others };
+  }
+
+  function renderClassification() {
+    var res = classifyText(output.value);
+    var defs = [
+      { title: '链接 / 邮箱', items: res.links },
+      { title: '编号 / 数字串', items: res.codes },
+      { title: '其他文本', items: res.others }
+    ];
+    clsList.innerHTML = '';
+    var any = false;
+    defs.forEach(function (def) {
+      if (!def.items.length) return;
+      any = true;
+      var block = document.createElement('div');
+      block.className = 'cls-block';
+      var head = document.createElement('div');
+      head.className = 'cls-head';
+      var t = document.createElement('span');
+      t.textContent = def.title;
+      var c = document.createElement('span');
+      c.className = 'cnt';
+      c.textContent = def.items.length + ' 项';
+      var sp = document.createElement('span');
+      sp.className = 'spacer';
+      var b = document.createElement('button');
+      b.className = 'ghost mini';
+      b.type = 'button';
+      b.textContent = '复制';
+      b.addEventListener('click', function () {
+        copyToClipboard(def.items.join('\n'), '已复制' + def.title);
+      });
+      head.appendChild(t);
+      head.appendChild(c);
+      head.appendChild(sp);
+      head.appendChild(b);
+      var box = document.createElement('textarea');
+      box.className = 'cls-box';
+      box.readOnly = true;
+      box.spellcheck = false;
+      box.value = def.items.join('\n');
+      block.appendChild(head);
+      block.appendChild(box);
+      clsList.appendChild(block);
+    });
+    if (!any) {
+      var p = document.createElement('p');
+      p.className = 'cls-empty';
+      p.textContent = '没有识别到链接、邮箱或编号。';
+      clsList.appendChild(p);
+    }
+    clsWrap.hidden = false;
+  }
+
+  $('btnReclassify').addEventListener('click', function () {
+    if (!output.value) { flash('结果为空,先识别一张图片吧'); return; }
+    renderClassification();
+    flash('已按当前内容重新分类');
+  });
+
   /* ---------- 结果操作 ---------- */
   function updateCount() {
     countEl.textContent = output.value ? '共 ' + output.value.length + ' 个字符' : '';
   }
   output.addEventListener('input', updateCount);
 
-  $('btnCopy').addEventListener('click', function () {
-    var text = output.value;
-    if (!text) { flash('结果为空,没什么可复制的'); return; }
+  function copyToClipboard(text, okMsg) {
+    if (!text) { flash('内容为空,没什么可复制的'); return; }
     function fallback() {
-      output.focus();
-      output.select();
+      var ta = document.createElement('textarea');
+      ta.value = text;
+      ta.style.position = 'fixed';
+      ta.style.opacity = '0';
+      document.body.appendChild(ta);
+      ta.select();
       var ok = false;
       try { ok = document.execCommand('copy'); } catch (e) {}
-      flash(ok ? '已复制到剪贴板' : '已全选文本,请按 Ctrl + C 复制');
+      ta.remove();
+      flash(ok ? okMsg : '复制失败,请手动选取文本按 Ctrl + C 复制');
     }
     if (navigator.clipboard && navigator.clipboard.writeText) {
-      navigator.clipboard.writeText(text).then(
-        function () { flash('已复制到剪贴板'); },
-        fallback
-      );
+      navigator.clipboard.writeText(text).then(function () { flash(okMsg); }, fallback);
     } else {
       fallback();
     }
+  }
+
+  $('btnCopy').addEventListener('click', function () {
+    copyToClipboard(output.value, '已复制到剪贴板');
   });
 
   $('btnDownload').addEventListener('click', function () {
@@ -624,6 +803,7 @@ select {
   $('btnClearOut').addEventListener('click', function () {
     output.value = '';
     updateCount();
+    clsWrap.hidden = true;
     flash('已清空结果');
   });
 })();
